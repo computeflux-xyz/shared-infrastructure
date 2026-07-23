@@ -103,7 +103,6 @@ jobs:
           images: ${{ steps.registry-creds.outputs.registry-url }}/${{ steps.image-name.outputs.name }}
           tags: |
             type=raw,value=${{ inputs.image-tag }}
-            type=sha,prefix={{branch}}-
           flavor: |
             latest=false
 

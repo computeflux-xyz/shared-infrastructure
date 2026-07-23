@@ -25,7 +25,14 @@ jobs:
           terraform_version: "1.9.8"
 
       - name: Format check
-        run: terraform fmt -check -recursive
+        run: |
+          # .tfvars / .tfstate are git-crypt-encrypted in CI and can't be parsed,
+          # so fmt-check only the .tf files.
+          fail=0
+          while IFS= read -r f; do
+            terraform fmt -check "$f" >/dev/null || { echo "unformatted: $f"; fail=1; }
+          done < <(find . -path ./.terraform -prune -o -name '*.tf' -print)
+          exit $fail
 
       - name: Init (no backend)
         run: terraform init -backend=false
