@@ -1,0 +1,4 @@
+terraform/terraform.tfstate      filter=git-crypt diff=git-crypt
+terraform/terraform.tfvars       filter=git-crypt diff=git-crypt
+terraform/kubeconfig             filter=git-crypt diff=git-crypt
+terraform/talosconfig            filter=git-crypt diff=git-crypt

@@ -1,0 +1,40 @@
+@startuml cicd
+' How a service pipeline drives the shared reusable workflows.
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam ArrowColor #444444
+skinparam sequence {
+  LifeLineBorderColor #888888
+  ParticipantBorderColor #444444
+  ParticipantBackgroundColor White
+}
+title Service CI/CD through shared reusable workflows
+
+actor Developer as dev
+participant "service workflow\n(<name>.yaml)" as svc
+participant ".check-pipeline-flags" as flags
+participant ".docker-build-push" as build
+participant ".migration-run" as migrate
+participant ".deploy-k8s" as deploy
+participant "zot registry" as zot
+participant "cluster\n(argo-rollouts)" as cluster
+
+dev -> svc : push to main (or --deploy in commit)
+svc -> flags : which steps run?
+flags --> svc : should-push, should-deploy,\nmigration-action, image-tag
+svc -> build : build image (image-tag)
+build -> zot : push
+svc -> migrate : run DB migration job
+migrate -> cluster : apply migration (cnpg DB)
+svc -> deploy : helmfile apply (image-tag)
+deploy -> cluster : Rollout updated
+cluster -> zot : pull image
+cluster --> deploy : rollout status (canary -> stable)
+deploy --> dev : deployment summary
+
+note over flags, deploy
+  Reusable workflows live in
+  computeflux-org/shared-infrastructure/.github/workflows/
+  and are called with `uses: ...@main`.
+end note
+@enduml

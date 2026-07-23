@@ -1,0 +1,41 @@
+@startuml service-deploy
+' Anatomy of a service's deploy/ directory and what it binds to in shared infra.
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam rectangle {
+  BackgroundColor White
+  BorderColor #444444
+  RoundCorner 6
+}
+skinparam package {
+  BackgroundColor #F4F4F4
+  BorderColor #888888
+}
+skinparam ArrowColor #444444
+title Per-service deploy anatomy (example: bijougabriel-api)
+
+package "service repo: services/<name>/deploy/k8s/" {
+  rectangle "helmfile.gotmpl\l(release -> ./helm, IMAGE_TAG env)" as helmfile
+  rectangle "helm/\l  Chart.yaml\l  values.yaml\l  templates/rollout.yaml   (argoproj Rollout, canary)\l  templates/service.yaml\l  templates/configmap.yaml" as helm
+  rectangle "database/database.yaml\l  cnpg Cluster + ScheduledBackup" as db
+  rectangle "*.sealed.yaml\l  DB creds, S3/R2/KV creds, API keys" as secrets
+  rectangle "namespace.yaml" as ns
+}
+
+package "shared-infrastructure" {
+  rectangle "cloudnative-pg operator\n(foundation)" as cnpg
+  rectangle "argo-rollouts\n(foundation)" as rollouts
+  rectangle "sealed-secrets\n(foundation)" as sealed
+  rectangle "zot registry\n(platform)" as zot
+  rectangle "api-gateway ingress\n(platform)" as gw
+  rectangle "Hetzner S3\ncomputeflux-db-backups" as s3
+}
+
+helmfile --> helm
+helm --> rollouts : Rollout CR reconciled by
+db --> cnpg : Cluster CR reconciled by
+db --> s3 : barmanObjectStore backups
+secrets --> sealed : decrypted by
+helm --> zot : image pulled from
+helm ..> gw : route registered on
+@enduml

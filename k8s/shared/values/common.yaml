@@ -1,0 +1,24 @@
+cluster:
+  name: computeflux
+  domain: computeflux.local
+
+storage:
+  defaultClass: hcloud-volumes-encrypted
+  # Note: If you enable Longhorn later, change this to 'longhorn'
+
+# Service endpoints (DNS names within cluster)
+endpoints:
+  # Database endpoints
+  postgres:
+    # Primary (read-write)
+    shared: shared-pg-cluster-rw.data.svc.cluster.local:5432
+    # Read-only replicas
+    shared_ro: shared-pg-cluster-ro.data.svc.cluster.local:5432
+    # Read service (round-robin across all instances)
+    shared_r: shared-pg-cluster-r.data.svc.cluster.local:5432
+
+  # Platform endpoints
+  platform:
+    registry: registry.computeflux.xyz
+    api_gateway: apigateway.computeflux.xyz
+    umami: umami.platform.svc.cluster.local:3000

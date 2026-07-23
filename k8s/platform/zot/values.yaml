@@ -1,0 +1,181 @@
+image:
+  repository: ghcr.io/project-zot/zot
+  tag: v2.1.11
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 5000
+
+ingress:
+  enabled: true
+  className: nginx
+  pathtype: Prefix
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+  hosts:
+    - host: registry.computeflux.xyz
+      paths:
+        - path: /
+  tls:
+    - secretName: zot-tls
+      hosts:
+        - registry.computeflux.xyz
+
+# Disable persistence (using S3)
+persistence: false
+pvc:
+  create: false
+
+mountSecret: true
+
+secretFiles:
+  # This will be overridden by our sealed secret
+  htpasswd: ""
+
+extraVolumes:
+  - name: htpasswd
+    secret:
+      secretName: zot-htpasswd
+      items:
+        - key: htpasswd
+          path: htpasswd
+
+extraVolumeMounts:
+  - name: htpasswd
+    mountPath: /auth
+    readOnly: true
+
+env:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: zot-s3-credentials
+        key: access-key
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: zot-s3-credentials
+        key: secret-key
+  - name: AWS_REGION
+    value: "fsn1"
+
+# Zot configuration with S3 backend
+mountConfig: true
+configFiles:
+  config.json: |
+    {
+      "distSpecVersion": "1.1.0",
+      "storage": {
+        "rootDirectory": "/tmp/zot",
+        "dedupe": true,
+        "remoteCache": false,
+        "gc": true,
+        "gcDelay": "1h",
+        "gcInterval": "24h",
+        "storageDriver": {
+          "name": "s3",
+          "region": "fsn1",
+          "bucket": "computeflux-registry",
+          "regionendpoint": "https://fsn1.your-objectstorage.com",
+          "secure": true,
+          "skipverify": false
+        }
+      },
+      "http": {
+        "address": "0.0.0.0",
+        "port": "5000",
+        "auth": {
+          "htpasswd": {
+            "path": "/auth/htpasswd"
+          }
+        },
+        "accessControl": {
+          "repositories": {
+            "**": {
+              "policies": [
+                {
+                  "users": ["admin"],
+                  "actions": ["read", "create", "update", "delete"]
+                }
+              ],
+              "defaultPolicy": []
+            }
+          },
+          "adminPolicy": {
+            "users": ["admin"],
+            "actions": ["read", "create", "update", "delete"]
+          }
+        }
+      },
+      "log": {
+        "level": "info",
+        "output": "/dev/stdout"
+      },
+      "extensions": {
+        "search": {
+          "enable": true,
+          "cve": null
+        },
+        "ui": {
+          "enable": true
+        },
+        "metrics": {
+          "enable": true,
+          "prometheus": {
+            "path": "/metrics"
+          }
+        },
+        "scrub": {
+          "enable": false
+        },
+        "lint": {
+          "enable": false
+        }
+      }
+    }
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+httpGet:
+  port: 5000
+  scheme: HTTP
+
+startupProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 30
+
+strategy:
+  type: RollingUpdate
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false  # Enable later with Prometheus
+
+podLabels:
+  app: zot
+  component: registry
+
+podAnnotations: {}
+
+dnsPolicy: ClusterFirst

@@ -1,0 +1,129 @@
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: shared-pg-cluster
+  namespace: data
+  labels:
+    app: postgresql
+    cluster: shared
+spec:
+  description: "Shared PostgreSQL cluster for platform services"
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.2
+  instances: 3
+  startDelay: 300
+  stopDelay: 300
+  primaryUpdateStrategy: unsupervised
+
+  postgresql:
+    parameters:
+      shared_buffers: "256MB"
+      effective_cache_size: "1GB"
+      maintenance_work_mem: "64MB"
+      work_mem: "16MB"
+
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+
+      wal_buffers: "16MB"
+      min_wal_size: "1GB"
+      max_wal_size: "4GB"
+
+      checkpoint_completion_target: "0.9"
+
+      max_connections: "100"
+
+      auto_explain.log_min_duration: "10s"
+      auto_explain.log_analyze: "true"
+      auto_explain.log_buffers: "true"
+
+      log_statement: "ddl"
+      log_duration: "off"
+      log_line_prefix: "%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h "
+      log_checkpoints: "on"
+      log_connections: "on"
+      log_disconnections: "on"
+      log_lock_waits: "on"
+      log_temp_files: "0"
+
+    pg_hba:
+      - host all all 10.0.0.0/8 scram-sha-256
+      - host all all 0.0.0.0/0 reject
+
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+      postInitSQL:
+        - CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+        - CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        - CREATE EXTENSION IF NOT EXISTS btree_gin;
+        - CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+  enableSuperuserAccess: true
+  superuserSecret:
+    name: shared-pg-superuser
+
+  storage:
+    storageClass: hcloud-volumes-encrypted
+    size: 20Gi
+
+  walStorage:
+    storageClass: hcloud-volumes-encrypted
+    size: 5Gi
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+
+  nodeMaintenanceWindow:
+    inProgress: false
+    reusePVC: true
+
+  monitoring:
+    enablePodMonitor: false
+
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: shared-pg-pooler
+  namespace: data
+spec:
+  cluster:
+    name: shared-pg-cluster
+
+  instances: 3
+  type: rw
+
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "25"
+      reserve_pool_size: "5"
+      reserve_pool_timeout: "5"
+
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

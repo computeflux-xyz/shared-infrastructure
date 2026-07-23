@@ -1,0 +1,69 @@
+helmDefaults:
+  wait: true
+  timeout: 600
+  atomic: true
+  createNamespace: true
+  args:
+    - "--force-conflicts"
+
+repositories:
+  - name: sealed-secrets
+    url: https://bitnami-labs.github.io/sealed-secrets
+  - name: argo
+    url: https://argoproj.github.io/argo-helm
+  - name: cloudnative-pg
+    url: https://cloudnative-pg.github.io/charts
+  - name: zot
+    url: https://zotregistry.dev/helm-charts/
+
+releases:
+  # ---------------------------------------------------------------------------
+  # Foundation: secrets, progressive delivery, database operator.
+  # (cert-manager and ingress-nginx are installed by Terraform, see hcloud/.)
+  # ---------------------------------------------------------------------------
+  - name: sealed-secrets
+    namespace: foundation
+    chart: sealed-secrets/sealed-secrets
+    version: 2.17.9
+    values:
+      - foundation/sealed-secrets/values.yaml
+    labels:
+      layer: foundation
+      component: secrets
+
+  - name: argo-rollouts
+    namespace: foundation
+    chart: argo/argo-rollouts
+    version: 2.40.3
+    needs:
+      - foundation/sealed-secrets
+    values:
+      - foundation/argo-rollouts/values.yaml
+    labels:
+      layer: foundation
+      component: deployments
+
+  - name: cloudnative-pg
+    namespace: foundation
+    chart: cloudnative-pg/cloudnative-pg
+    version: 0.26.1
+    needs:
+      - foundation/sealed-secrets
+    values:
+      - foundation/cloudnative-pg/values.yaml
+    labels:
+      layer: foundation
+      component: database-operator
+
+  # ---------------------------------------------------------------------------
+  # Platform: container registry.
+  # ---------------------------------------------------------------------------
+  - name: zot
+    namespace: platform
+    chart: zot/zot
+    version: 0.1.91
+    values:
+      - platform/zot/values.yaml
+    labels:
+      layer: platform
+      component: registry

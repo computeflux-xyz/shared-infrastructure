@@ -1,0 +1,49 @@
+version: '3'
+
+includes:
+  k8s:
+    taskfile: ./k8s/Taskfile.yaml
+    dir: ./k8s
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  tf:init:
+    desc: terraform init
+    dir: terraform
+    cmds:
+      - terraform init
+
+  tf:fmt:
+    desc: terraform fmt (recursive)
+    dir: terraform
+    cmds:
+      - terraform fmt -recursive
+
+  tf:plan:
+    desc: terraform plan
+    dir: terraform
+    cmds:
+      - terraform plan
+
+  tf:apply:
+    desc: terraform apply
+    dir: terraform
+    cmds:
+      - terraform apply
+
+  tf:kubeconfig:
+    desc: merge the cluster kubeconfig into ~/.kube/config
+    dir: terraform
+    cmds:
+      - ./merge-kubeconfig.sh
+
+  docs:build:
+    desc: render diagrams and build the Bikeshed guide to docs/index.html
+    cmds:
+      - plantuml -tsvg docs/diagrams/*.puml
+      - bikeshed spec docs/spec.bs docs/index.html
+      - 'echo "built docs/index.html"'

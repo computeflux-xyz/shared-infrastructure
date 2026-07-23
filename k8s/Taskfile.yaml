@@ -1,0 +1,150 @@
+version: '3'
+
+vars:
+  SEALED_SECRETS_CERT_CMD: kubectl get secret -n foundation -l sealedsecrets.bitnami.com/sealed-secrets-key=active -o jsonpath='{.items[0].data.tls\.crt}' | base64 -d
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  init:
+    desc: Add/update Helm repositories
+    cmds:
+      - helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+      - helm repo add argo https://argoproj.github.io/argo-helm
+      - helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+      - helm repo add zot https://zotregistry.dev/helm-charts/
+      - helm repo update
+
+  deploy:all:
+    desc: Deploy every layer in order
+    cmds:
+      - task: deploy:foundation
+      - task: deploy:data
+      - task: deploy:platform
+      - task: deploy:umami
+      - task: deploy:github-actions
+
+  deploy:foundation:
+    desc: sealed-secrets, argo-rollouts, cloudnative-pg operator, letsencrypt ClusterIssuer
+    deps: [init]
+    cmds:
+      - kubectl apply -f namespaces/foundation.yaml
+      - helmfile apply --selector layer=foundation
+      - kubectl apply -f foundation/cert-manager/cluster-issuer.yaml
+
+  deploy:data:
+    desc: Shared PostgreSQL cluster (CloudNativePG)
+    deps: [init]
+    cmds:
+      - kubectl apply -f namespaces/data.yaml
+      - kubectl apply -f shared/secrets/postgres-superuser.sealed.yaml
+      - "kubectl wait --for=jsonpath='{.data.password}' secret/shared-pg-superuser -n data --timeout=60s || true"
+      - kubectl apply -f data/postgres/
+      - kubectl get cluster -n data
+
+  deploy:platform:
+    desc: Zot registry + API gateway ingress
+    deps: [init]
+    cmds:
+      - kubectl apply -f namespaces/platform.yaml
+      - kubectl apply -f shared/secrets/zot-s3-credentials.sealed.yaml
+      - kubectl apply -f shared/secrets/zot-registry-auth.sealed.yaml
+      - sleep 5
+      - platform/zot/create-htpasswd-secret.sh
+      - helmfile apply --selector component=registry
+      - kubectl apply -f platform/api-gateway/ingress.yaml
+      - kubectl get ingress,pods -n platform
+
+  deploy:umami:
+    desc: Umami analytics (dedicated cnpg DB + deployment + gateway routes)
+    deps: [init]
+    cmds:
+      - kubectl apply -f namespaces/platform.yaml
+      # DB backups reuse the platform S3 credentials secret.
+      - kubectl apply -f shared/secrets/zot-s3-credentials.sealed.yaml
+      - kubectl apply -f platform/umami/database.yaml
+      - "kubectl wait --for=condition=Ready cluster/umami-pg-cluster -n platform --timeout=300s || true"
+      - kubectl apply -f platform/umami/deployment.yaml
+      - kubectl apply -f platform/umami/service.yaml
+      - kubectl apply -f platform/api-gateway/ingress.yaml
+      - "kubectl rollout status deployment/umami -n platform --timeout=300s"
+      - echo "Tracker script -> https://apigateway.computeflux.xyz/push-analytics/script.js"
+      - echo "Dashboard (internal only) -> kubectl -n platform port-forward svc/umami 3000:3000"
+
+  deploy:github-actions:
+    desc: GitHub Actions deployer ServiceAccount + RBAC; prints the kubeconfig for the KUBE_CONFIG secret
+    cmds:
+      - kubectl apply -f namespaces/github-actions.yaml
+      - kubectl apply -f github-actions/
+      - sleep 3
+      - ./github-actions/generate-kubeconfig.sh > /tmp/github-kubeconfig.yaml
+      - chmod 600 /tmp/github-kubeconfig.yaml
+      - 'echo "Add /tmp/github-kubeconfig.yaml as the KUBE_CONFIG Actions secret"'
+
+  status:
+    desc: Show managed workloads across layers
+    cmds:
+      - echo "== foundation ==" && kubectl get pods -n foundation
+      - echo "== data ==" && kubectl get pods,cluster -n data
+      - echo "== platform ==" && kubectl get pods,cluster,ingress -n platform
+
+  seal:secret:
+    desc: Seal a single key/value into a SealedSecret file
+    interactive: true
+    cmds:
+      - |
+        read -p "Secret name: " SECRET_NAME
+        read -p "Namespace: " SECRET_NAMESPACE
+        read -p "Key name: " SECRET_KEY
+        read -p "Value (or 'generate' for a random one): " SECRET_VALUE
+        read -p "Output file (e.g. shared/secrets/x.sealed.yaml): " OUTPUT_FILE
+        if [ "$SECRET_VALUE" = "generate" ]; then
+          SECRET_VALUE=$(openssl rand -base64 32)
+          echo "Generated: $SECRET_VALUE  (save this)"
+        fi
+        TMP=$(mktemp)
+        cat > "$TMP" <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: $SECRET_NAME
+          namespace: $SECRET_NAMESPACE
+        type: Opaque
+        stringData:
+          $SECRET_KEY: "$SECRET_VALUE"
+        EOF
+        kubeseal --format=yaml --cert=<({{.SEALED_SECRETS_CERT_CMD}}) < "$TMP" > "$OUTPUT_FILE"
+        rm "$TMP"
+        echo "Wrote $OUTPUT_FILE (safe to commit)"
+
+  seal:secret:multi:
+    desc: Seal multiple key/value pairs into one SealedSecret file
+    interactive: true
+    cmds:
+      - |
+        read -p "Secret name: " SECRET_NAME
+        read -p "Namespace: " SECRET_NAMESPACE
+        read -p "Output file: " OUTPUT_FILE
+        TMP=$(mktemp)
+        cat > "$TMP" <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: $SECRET_NAME
+          namespace: $SECRET_NAMESPACE
+        type: Opaque
+        stringData:
+        EOF
+        echo "Enter key/value pairs (empty key to finish):"
+        while true; do
+          read -p "  key: " K; [ -z "$K" ] && break
+          read -p "  value ('generate' for random): " V
+          [ "$V" = "generate" ] && { V=$(openssl rand -base64 32); echo "    generated: $V"; }
+          echo "  $K: \"$V\"" >> "$TMP"
+        done
+        kubeseal --format=yaml --cert=<({{.SEALED_SECRETS_CERT_CMD}}) < "$TMP" > "$OUTPUT_FILE"
+        rm "$TMP"
+        echo "Wrote $OUTPUT_FILE (safe to commit)"

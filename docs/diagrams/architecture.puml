@@ -1,0 +1,57 @@
+@startuml architecture
+' How the Terraform bare-metal plane and the shared Kubernetes plane relate.
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam rectangle {
+  BackgroundColor White
+  BorderColor #444444
+  RoundCorner 6
+}
+skinparam package {
+  BackgroundColor #F4F4F4
+  BorderColor #888888
+}
+skinparam ArrowColor #444444
+title ComputeFlux infrastructure: two planes, one boundary
+
+package "Terraform plane (terraform/)" {
+  package "Hetzner bare metal (hcloud/)" {
+    rectangle "Talos control plane\n+ worker node pools" as talos
+    rectangle "Cilium CNI\n(IPsec, Hubble)" as cilium
+    rectangle "ingress-nginx\n+ Hetzner LB" as ingress
+    rectangle "cert-manager" as certm
+    rectangle "hcloud-csi /\nLonghorn storage" as storage
+  }
+  package "Hetzner object storage (s3.tf)" {
+    rectangle "etcd-backups\nregistry\nassets\ndb-backups\nlonghorn-backups" as buckets
+  }
+}
+
+note as cfnote
+  Cloudflare edge (Workers, KV, R2, DNS) is NOT shared infrastructure.
+  Each service provisions its own in <service>/deploy/terraform.
+end note
+
+rectangle "kubeconfig + talosconfig\n(git-crypt encrypted)" as kubeconfig #FFF8E1
+
+package "Kubernetes plane (k8s/)" {
+  rectangle "foundation\nsealed-secrets, argo-rollouts, cloudnative-pg" as found
+  rectangle "data\nshared PostgreSQL (cnpg)" as data
+  rectangle "platform\nzot, api-gateway, umami" as platform
+  rectangle "github-actions\ndeployer SA + RBAC" as gha
+}
+
+talos --> kubeconfig : emits
+kubeconfig --> found : helmfile / kubectl\nauthenticate with
+found --> data
+found --> platform
+found --> gha
+storage ..> data : PVCs (encrypted volumes)
+buckets ..> platform : registry + backups (S3)
+ingress ..> platform : north-south traffic
+
+note bottom of kubeconfig
+  Terraform builds the substrate and hands over exactly one thing:
+  cluster credentials. Everything above the line is declared in k8s/.
+end note
+@enduml

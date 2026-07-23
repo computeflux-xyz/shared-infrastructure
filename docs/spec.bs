@@ -1,0 +1,456 @@
+<pre class='metadata'>
+Title: ComputeFlux Shared Infrastructure
+Shortname: computeflux-infra
+Level: 1
+Status: DREAM
+Editor: Gabriel Mougard
+Abstract: A practical guide to the ComputeFlux shared infrastructure repository:
+    how the Terraform bare-metal plane and the shared Kubernetes plane fit
+    together, and how to write the per-service deployment logic that runs on top.
+Markup Shorthands: markdown yes
+Boilerplate: conformance off, copyright off
+</pre>
+
+Introduction {#intro}
+=====================
+
+This repository holds the two layers of infrastructure that every ComputeFlux
+service depends on, and nothing that belongs to a single service.
+
+- The **Terraform plane** (`terraform/`) provisions bare metal: a Talos
+    Kubernetes cluster on Hetzner and the Hetzner object storage buckets. It is
+    run by an operator with cloud credentials. Cloudflare edge resources are not
+    here: they are per-service (see [[#per-service-cf]]).
+- The **Kubernetes plane** (`k8s/`) installs the shared platform that runs on
+    that cluster: secrets, progressive delivery, the Postgres operator, a
+    registry, the API gateway, and analytics.
+
+A service lives in its own repository and ships only its own deployment logic
+(a container image, a Helm release, its database, its secrets, its routes). It
+consumes the two planes described here. The last section explains exactly how.
+
+The point of keeping the two planes in one repository is that they share one
+lifecycle boundary and one set of credentials, described next.
+
+How the two planes relate {#planes}
+====================================
+
+<figure>
+  <img src="diagrams/architecture.svg" alt="Terraform provisions the cluster, storage and edge, then hands a kubeconfig to the Kubernetes plane, which installs the shared platform.">
+  <figcaption>The Terraform plane and the Kubernetes plane meet at the kubeconfig.</figcaption>
+</figure>
+
+The two planes do not overlap. They meet at exactly one artifact: the cluster
+credentials.
+
+Terraform owns the substrate {#tf-owns}
+---------------------------------------
+
+`terraform/` builds everything that a Kubernetes API cannot build for itself:
+
+- **Nodes and OS**: Talos control plane and worker node pools on Hetzner Cloud
+    (`terraform/hcloud/`), with disk encryption and a fixed Kubernetes version.
+- **In-cluster substrate installed by Terraform**: the Cilium CNI (with IPsec
+    and Hubble), ingress-nginx behind a Hetzner load balancer, cert-manager, the
+    Hetzner CSI and Longhorn storage classes, and the metrics server. These are
+    installed through the Terraform helm provider because they must exist before
+    any workload, and because they are tied to node and network configuration.
+- **Object storage** (`terraform/s3.tf`): the Hetzner buckets for etcd backups,
+    the registry, assets, database backups and Longhorn backups.
+
+When `terraform apply` finishes it writes two files: `kubeconfig` and
+`talosconfig`. Both are encrypted at rest with git-crypt. That is the entire
+handover.
+
+The Kubernetes plane owns the platform {#k8s-owns}
+--------------------------------------------------
+
+`k8s/` takes the kubeconfig as a given and declares everything above it with
+Helmfile and `kubectl`. It never provisions nodes or cloud resources. It assumes
+cert-manager, ingress-nginx, the CNI and the storage classes are already there,
+because Terraform installed them.
+
+This split is why the boundary is stable: changing a node pool size or a storage
+class is a Terraform concern; adding a platform service or a database is a
+Kubernetes concern. The two rarely change together.
+
+Lifecycle order {#lifecycle}
+----------------------------
+
+1. `cd terraform && terraform apply`.
+2. `./terraform/merge-kubeconfig.sh` to add the cluster to your kubeconfig.
+3. `cd k8s && task deploy:all` to install the shared platform.
+4. Services deploy themselves through CI (see [[#per-service]]).
+
+The Terraform plane {#terraform}
+================================
+
+Bare metal (`terraform/hcloud/`) {#hcloud}
+------------------------------------------
+
+A self-contained Talos-on-Hetzner module. The root wires it up in
+`terraform/kubernetes.tf`: node pool sizes and locations, Kubernetes and Talos
+versions, Cilium settings, storage classes, firewall rules, and etcd backups to
+Hetzner S3. Treat this module as a unit; it is configured through its input
+variables, not edited.
+
+Object storage (`terraform/s3.tf`) {#s3}
+----------------------------------------
+
+Hetzner object storage is S3-compatible and is reached through the AWS provider
+pointed at the Hetzner endpoint. The buckets created here are shared: services
+do not create their own buckets, they write under a prefix in `computeflux-assets`
+or back up to a prefix in `computeflux-db-backups`.
+
+No Cloudflare here {#no-cloudflare}
+-----------------------------------
+
+Cloudflare Workers, KV, R2 and DNS are not shared infrastructure. Each of those
+resources belongs to one service, so it lives in that service's own
+`deploy/terraform`. See [[#per-service-cf]] for the pattern and a worked example.
+
+The Kubernetes plane {#kubernetes}
+==================================
+
+<figure>
+  <img src="diagrams/layers.svg" alt="Layers applied top to bottom: Terraform-provided substrate, then foundation, data, platform and github-actions, then services.">
+  <figcaption>The shared layers and their apply order.</figcaption>
+</figure>
+
+Everything is applied by `k8s/Taskfile.yaml`, which drives `k8s/helmfile.yaml.gotmpl`
+for the Helm releases and `kubectl apply` for the plain manifests.
+
+foundation {#foundation}
+------------------------
+
+The layer everything else needs.
+
+- **sealed-secrets**: decrypts `*.sealed.yaml` manifests in-cluster, so encrypted
+    secrets can live in git.
+- **argo-rollouts**: the Rollout controller that services use for canary
+    deployments.
+- **cloudnative-pg**: the Postgres operator. Services declare a `Cluster` and the
+    operator runs it.
+- **letsencrypt ClusterIssuer**: applied here, backed by the Terraform-installed
+    cert-manager.
+
+data {#data}
+------------
+
+`shared-pg-cluster`, a three-node CloudNativePG cluster with a PgBouncer pooler,
+for platform services that do not warrant a dedicated database. Services that do
+warrant one run their own `Cluster` in their own namespace (see [[#per-service]]).
+
+platform {#platform}
+--------------------
+
+- **zot**: an OCI registry at `registry.computeflux.xyz`, backed by Hetzner S3.
+    This is where service images are pushed and pulled.
+- **api-gateway**: the ingress that owns `apigateway.computeflux.xyz` and its TLS
+    certificate. Services attach their public routes to this host.
+- **umami**: self-hosted analytics, described in [[#umami]].
+
+github-actions {#gha}
+---------------------
+
+A `github-deployer` ServiceAccount and ClusterRole scoped to what a deployment
+needs (secrets, rollouts, cnpg clusters, jobs, ingresses). Its kubeconfig is
+generated by `github-actions/generate-kubeconfig.sh` and stored as the
+`KUBE_CONFIG` Actions secret. This is the identity every service pipeline uses to
+reach the cluster.
+
+Analytics (umami) {#umami}
+--------------------------
+
+Umami is exposed on `apigateway.computeflux.xyz` under `/push-analytics`, but only
+three paths are public: `script.js` (the tracker) and `api/send` plus `api/batch`
+(the event collectors). The gateway maps that prefix down to the app root with an
+nginx rewrite, because Umami's own `BASE_PATH` is a build-time setting and has no
+effect on the prebuilt image. Everything else under the prefix (the dashboard,
+`/login`, admin APIs) has no ingress path and returns 404 from outside; reach the
+dashboard with `kubectl -n platform port-forward svc/umami 3000:3000`.
+
+Sites embed the tracker with an explicit `data-host-url` so events post to the
+public subpath:
+
+```html
+<script defer
+        src="https://apigateway.computeflux.xyz/push-analytics/script.js"
+        data-website-id="..."
+        data-host-url="https://apigateway.computeflux.xyz/push-analytics"></script>
+```
+
+Its database is a dedicated single-instance CloudNativePG cluster with WAL
+archiving and a daily base backup to `s3://computeflux-db-backups/umami/`. It is a
+compact worked example of the per-service database pattern that follows.
+
+Writing per-service infrastructure {#per-service}
+==================================================
+
+A service owns its deployment logic in its own repository, typically under
+`deploy/k8s/`. The shared planes provide the operators, the registry, the gateway
+and the credentials; the service provides the manifests that use them.
+
+<figure>
+  <img src="diagrams/service-deploy.svg" alt="A service deploy directory contains a helmfile, a helm chart with a Rollout, a cnpg database, sealed secrets and a namespace, each binding to a shared-infrastructure component.">
+  <figcaption>What a service's deploy directory contains and what each part binds to.</figcaption>
+</figure>
+
+The Kubernetes side {#per-service-k8s}
+--------------------------------------
+
+Model it on `services/bijougabriel-api/deploy/k8s/`. A minimal service directory:
+
+```
+deploy/k8s/
+  namespace.yaml
+  helmfile.gotmpl
+  helm/
+    Chart.yaml
+    values.yaml
+    templates/rollout.yaml
+    templates/service.yaml
+    templates/configmap.yaml
+  database/database.yaml
+  <service>-*.sealed.yaml
+```
+
+**helmfile.gotmpl** points the release at the local chart and takes the image tag
+from the environment, which is how CI passes the freshly built tag:
+
+```yaml
+releases:
+  - name: myservice
+    namespace: myservice
+    chart: ./helm
+    values:
+      - image:
+          tag: '{{ env "IMAGE_TAG" | default "latest" }}'
+```
+
+**templates/rollout.yaml** is an Argo `Rollout`, not a `Deployment`, so the
+foundation rollouts controller drives a canary. The essential shape:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicas }}
+  strategy:
+    canary:
+      steps:
+        - setWeight: 50
+        - pause: { duration: 30s }
+        - setWeight: 100
+  selector:
+    matchLabels: { app: {{ .Release.Name }} }
+  template:
+    spec:
+      imagePullSecrets:
+        - name: registry-pull-secret          # pulls from zot
+      containers:
+        - name: myservice
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          # secrets arrive as env from SealedSecrets; config from a ConfigMap
+```
+
+Keep credentials out of the ConfigMap. The pattern is: render non-secret config
+into a `ConfigMap`, and inject every secret as an environment variable from a
+`secretKeyRef` pointing at a SealedSecret. The ConfigMap keeps empty placeholders
+for the secret fields so the shape is documented in one place.
+
+**database/database.yaml** is a CloudNativePG `Cluster` plus a `ScheduledBackup`.
+This is how a service gets its own Postgres with backups to Hetzner S3:
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: myservice-pg-cluster
+  namespace: myservice
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.2
+  bootstrap:
+    initdb:
+      database: myservice_db
+      owner: app
+      secret: { name: myservice-db-app-user }   # a SealedSecret
+  storage:
+    storageClass: hcloud-volumes-encrypted       # from Terraform
+    size: 10Gi
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://computeflux-db-backups/
+      endpointURL: https://fsn1.your-objectstorage.com
+      s3Credentials:
+        accessKeyId:     { name: myservice-s3-bucket, key: access-key }
+        secretAccessKey: { name: myservice-s3-bucket, key: secret-key }
+    retentionPolicy: "30d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: myservice-pg-backup
+  namespace: myservice
+spec:
+  schedule: "0 0 2 * * *"     # six fields: sec min hour dom mon dow (02:00 UTC)
+  cluster: { name: myservice-pg-cluster }
+```
+
+Note the cnpg schedule is a six-field cron expression, seconds first.
+
+**Secrets** are `SealedSecret` manifests committed next to the chart. Generate
+them against the cluster with `task seal:secret` from `k8s/`, which seals with the
+in-cluster sealed-secrets certificate. They are safe to commit because only the
+cluster can decrypt them.
+
+**Exposing the service** on the gateway: add a path for
+`apigateway.computeflux.xyz` that points at the service. When the service runs in
+another namespace, add an `ExternalName` Service in `platform` that aliases the
+in-cluster address, and point the gateway path at that. See the commented example
+in `k8s/platform/api-gateway/ingress.yaml`.
+
+The Cloudflare side {#per-service-cf}
+-------------------------------------
+
+Edge resources (a Worker, KV, R2, DNS) belong to a single service, so they live
+in that service's own `deploy/terraform`, not in shared-infrastructure. Split
+ownership by tool:
+
+- **wrangler owns the Worker**: code, static assets and custom-domain routing
+    ship with `wrangler deploy` from the service repo. Its config
+    (`wrangler.toml`) declares vars, routes and bindings.
+- **Terraform owns the durable edge storage** wrangler cannot create: R2 buckets
+    and their public custom domains, KV namespaces, cache rules.
+
+Worked example, `agency/services/site/deploy/terraform/`: the site is an Astro
+static-assets Worker (wrangler-deployed), and its article artifacts live in an R2
+bucket served publicly at `assets.computeflux.xyz`. The Terraform is just:
+
+```hcl
+resource "cloudflare_r2_bucket" "assets" {
+  account_id = var.cloudflare_account_id
+  name       = "computeflux-site-assets"
+  location   = "WEUR"
+}
+
+resource "cloudflare_r2_custom_domain" "assets" {
+  account_id  = var.cloudflare_account_id
+  bucket_name = cloudflare_r2_bucket.assets.name
+  zone_id     = var.cloudflare_zone_id
+  domain      = "assets.computeflux.xyz"
+  enabled     = true
+}
+```
+
+The Worker binds that bucket through `wrangler.toml`:
+
+```toml
+[[r2_buckets]]
+binding     = "ARTICLES"
+bucket_name = "computeflux-site-assets"
+```
+
+If a service instead wants Terraform to also manage the Worker resource itself
+(placeholder script, routes, DNS), use `cloudflare_workers_script` with
+`lifecycle { ignore_changes = [content, bindings, placement] }` so wrangler keeps
+shipping the code. Keep every Cloudflare credential in the service's own
+gitignored `terraform.tfvars`, never in shared-infrastructure.
+
+CI/CD {#cicd}
+=============
+
+<figure>
+  <img src="diagrams/cicd.svg" alt="A service workflow calls check-pipeline-flags, then docker-build-push to zot, then migration-run, then deploy-k8s, which updates the Argo Rollout.">
+  <figcaption>A service pipeline drives the shared reusable workflows.</figcaption>
+</figure>
+
+The reusable workflows live in this repository under `.github/workflows/` so
+every service references the same ones:
+
+- `.check-pipeline-flags.yaml`: reads the event and commit message and decides
+    what runs (push image, run migrations, deploy, dry-run) and which image tag to
+    use.
+- `.docker-build-push.yaml`: builds the image and pushes it to zot, using the
+    `KUBE_CONFIG` secret to read the registry credentials from the cluster.
+- `.deploy-k8s.yaml`: applies the service SealedSecrets, runs `helmfile apply`
+    with the built image tag, and waits on the Argo rollout.
+
+A service workflow wires them together and passes its own paths:
+
+```yaml
+jobs:
+  check-flags:
+    uses: computeflux-org/shared-infrastructure/.github/workflows/.check-pipeline-flags.yaml@main
+    with:
+      service-name: myservice
+      service-path: services/myservice
+
+  build:
+    needs: check-flags
+    uses: computeflux-org/shared-infrastructure/.github/workflows/.docker-build-push.yaml@main
+    with:
+      working-directory: services/myservice
+      image-name: myservice
+      should-push: ${{ needs.check-flags.outputs.should-push-app-image == 'true' }}
+      image-tag: ${{ needs.check-flags.outputs.image-tag }}
+    secrets: inherit
+
+  deploy:
+    needs: [check-flags, build]
+    if: needs.check-flags.outputs.should-deploy == 'true'
+    uses: computeflux-org/shared-infrastructure/.github/workflows/.deploy-k8s.yaml@main
+    with:
+      working-directory: services/myservice/deploy/k8s
+      image-tag: ${{ needs.check-flags.outputs.image-tag }}
+      dry-run: ${{ needs.check-flags.outputs.dry-run }}
+    secrets: inherit
+```
+
+A push to `main` builds, migrates and deploys. A pull request runs a dry-run
+(build without push, `helm diff` instead of apply) unless the commit message
+opts in with `--image-push` or `--deploy`. Down migrations on `main` require the
+explicit `--force-migrate-down-<version>` flag.
+
+Secrets {#secrets}
+==================
+
+Two mechanisms, by location.
+
+- **git-crypt** protects Terraform state and credentials at rest in this
+    repository: `terraform/terraform.tfstate`, `terraform.tfvars`, `kubeconfig`
+    and `talosconfig` (see `.gitattributes`). Clone-and-work needs the symmetric
+    key (`git-crypt unlock <keyfile>`) or a registered GPG key.
+- **sealed-secrets** protects Kubernetes secrets. A `SealedSecret` is encrypted
+    with the cluster's public certificate and can only be decrypted by the
+    in-cluster controller, so it is safe in git. This is what services commit next
+    to their manifests.
+
+Neither plaintext secret nor unsealed Kubernetes `Secret` should ever be
+committed.
+
+Bootstrap runbook {#runbook}
+============================
+
+From a fresh clone with the git-crypt key:
+
+```bash
+git-crypt unlock /path/to/keyfile
+
+cd terraform
+terraform init
+terraform plan            # read MIGRATION.md; confirm no destroys
+terraform apply
+./merge-kubeconfig.sh
+
+cd ../k8s
+task deploy:all           # foundation, data, platform, umami, github-actions
+task deploy:github-actions   # prints the KUBE_CONFIG for the Actions secret
+```
+
+Services deploy themselves from their own repositories through the CI in
+[[#cicd]].

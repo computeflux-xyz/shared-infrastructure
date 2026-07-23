@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Terraform
+.terraform/
+*.tfstate.backup
+*.tfstate.*.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Bikeshed / GitHub Pages
+docs/*.html
+docs/out/
+docs/diagrams/*.svg

@@ -1,0 +1,19 @@
+fullnameOverride: sealed-secrets-controller
+
+controller:
+  # Only allow sealed secrets in their own namespace
+  # Set to false if you want cluster-wide sealed secrets
+  namespaceEnabled: false
+
+# Resources
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+metrics:
+  serviceMonitor:
+    enabled: false  # Enable when Prometheus is deployed

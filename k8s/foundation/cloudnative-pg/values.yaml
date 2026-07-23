@@ -1,0 +1,39 @@
+# CloudNativePG Operator Configuration
+# Docs: https://cloudnative-pg.io/
+
+fullnameOverride: cloudnative-pg
+
+# Operator replicas
+replicaCount: 1
+
+# CRDs - install CustomResourceDefinitions
+crds:
+  create: true
+
+# Operator configuration
+config:
+  # Configuration for the operator
+  # Data path is set per-cluster, not at operator level
+  data: {}
+
+# Monitoring
+monitoring:
+  # Enable PodMonitor for Prometheus
+  podMonitorEnabled: false  # Enable when Prometheus is deployed
+
+# Resources for the operator
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Webhook configuration
+webhook:
+  port: 9443
+
+  # Mutual TLS
+  mutualTLS:
+    enabled: true

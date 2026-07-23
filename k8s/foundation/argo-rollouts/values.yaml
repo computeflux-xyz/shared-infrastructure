@@ -1,0 +1,24 @@
+fullnameOverride: argo-rollouts
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+dashboard:
+  enabled: false  # Enable if you want the web UI
+  service:
+    type: ClusterIP
+
+  # Uncomment if you want an ingress for the dashboard
+  # ingress:
+  #   enabled: true
+  #   hosts:
+  #     - rollouts.your-domain.com
+
+serviceMonitor:
+  enabled: false  # Enable when Prometheus is deployed

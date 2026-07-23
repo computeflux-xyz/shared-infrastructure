@@ -1,0 +1,42 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway
+  namespace: platform
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Umami runs at the container root (BASE_PATH is build-time only on the stock
+    # image), so map the public /push-analytics/... prefix down to the app paths.
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+spec:
+  ingressClassName: nginx
+  tls:
+    - secretName: api-gateway-tls
+      hosts:
+        - apigateway.computeflux.xyz
+  rules:
+    - host: apigateway.computeflux.xyz
+      http:
+        paths:
+          # --- Umami analytics: public surface only ---
+          # Exactly three paths are reachable from outside: the tracker script and
+          # the two event collectors. Everything else under /push-analytics (the
+          # dashboard, /login, admin APIs) has no match here and returns 404.
+          # Reach the admin UI with: kubectl -n platform port-forward svc/umami 3000:3000
+          - path: /push-analytics/(script\.js|api/send|api/batch)$
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: umami
+                port:
+                  number: 3000
+
+          # --- Per-service routes ---
+          # A service exposes itself behind this host by shipping its OWN Ingress
+          # object for apigateway.computeflux.xyz (no tls block; nginx serves it
+          # under this cert) with its own path and annotations. Do not add service
+          # paths to this Ingress: the rewrite-target above would rewrite them too.
+          # Cross-namespace backends use an ExternalName Service in `platform`.
+          # See docs/spec.bs, "Writing per-service infrastructure".

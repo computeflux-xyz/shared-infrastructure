@@ -1,0 +1,32 @@
+@startuml layers
+' The shared Kubernetes layers and their apply order.
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam rectangle {
+  BackgroundColor White
+  BorderColor #444444
+  RoundCorner 6
+}
+skinparam ArrowColor #444444
+title Shared Kubernetes layers (apply top to bottom)
+
+rectangle "Terraform-provided\ncert-manager  .  ingress-nginx  .  CNI  .  storage classes" as tf #EEEEEE
+
+rectangle "foundation\l  sealed-secrets   (decrypt SealedSecrets in-cluster)\l  argo-rollouts    (progressive delivery for services)\l  cloudnative-pg   (Postgres operator)\l  letsencrypt ClusterIssuer" as foundation
+
+rectangle "data\l  shared-pg-cluster  (3-node cnpg, pgbouncer pooler)" as data
+
+rectangle "platform\l  zot          (OCI registry, S3-backed)\l  api-gateway  (ingress for apigateway.computeflux.xyz)\l  umami        (analytics + dedicated cnpg DB)" as platform
+
+rectangle "github-actions\l  github-deployer ServiceAccount + ClusterRole\l  kubeconfig consumed as the KUBE_CONFIG Actions secret" as gha
+
+rectangle "services (own repos)\l  <namespace>/ Rollout + Service + cnpg Cluster + SealedSecrets" as services #F4F4F4
+
+tf --> foundation
+foundation --> data
+foundation --> platform
+foundation --> gha
+data --> services : DB via cnpg
+platform --> services : images + gateway routes
+gha --> services : deploy credentials
+@enduml

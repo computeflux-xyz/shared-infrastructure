@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: foundation
+  labels:
+    tier: infrastructure
+    layer: foundation
+    managed-by: helmfile
