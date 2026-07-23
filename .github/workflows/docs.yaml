@@ -1,0 +1,60 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PlantUML and Graphviz
+        run: sudo apt-get update && sudo apt-get install -y plantuml graphviz
+
+      - name: Render diagrams to SVG
+        run: plantuml -tsvg docs/diagrams/*.puml
+
+      - name: Install Bikeshed
+        run: |
+          pipx install bikeshed
+          bikeshed update
+
+      - name: Build the spec
+        run: bikeshed spec docs/spec.bs docs/index.html
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/diagrams
+          cp docs/index.html _site/index.html
+          cp docs/diagrams/*.svg _site/diagrams/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
