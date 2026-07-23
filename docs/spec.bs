@@ -385,14 +385,14 @@ A service workflow wires them together and passes its own paths:
 ```yaml
 jobs:
   check-flags:
-    uses: computeflux-org/shared-infrastructure/.github/workflows/.check-pipeline-flags.yaml@main
+    uses: computeflux-xyz/shared-infrastructure/.github/workflows/.check-pipeline-flags.yaml@main
     with:
       service-name: myservice
       service-path: services/myservice
 
   build:
     needs: check-flags
-    uses: computeflux-org/shared-infrastructure/.github/workflows/.docker-build-push.yaml@main
+    uses: computeflux-xyz/shared-infrastructure/.github/workflows/.docker-build-push.yaml@main
     with:
       working-directory: services/myservice
       image-name: myservice
@@ -403,7 +403,7 @@ jobs:
   deploy:
     needs: [check-flags, build]
     if: needs.check-flags.outputs.should-deploy == 'true'
-    uses: computeflux-org/shared-infrastructure/.github/workflows/.deploy-k8s.yaml@main
+    uses: computeflux-xyz/shared-infrastructure/.github/workflows/.deploy-k8s.yaml@main
     with:
       working-directory: services/myservice/deploy/k8s
       image-tag: ${{ needs.check-flags.outputs.image-tag }}

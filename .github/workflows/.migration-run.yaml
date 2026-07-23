@@ -1,0 +1,114 @@
+name: Run migration
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: true
+      db-host:
+        type: string
+        required: true
+      db-port:
+        type: string
+        required: false
+        default: "5432"
+      db-name:
+        type: string
+        required: true
+      db-secret-name:
+        description: "Secret with DB creds (keys: username, password)"
+        type: string
+        required: true
+      job-template-path:
+        description: "Path to the envsubst job template in the caller repo"
+        type: string
+        required: false
+        default: "tools/db-migration/k8s/ci-migration-job.yaml"
+      migration-action:
+        type: string
+        required: true
+      migration-command:
+        type: string
+        required: true
+      dry-run:
+        type: string
+        required: true
+
+jobs:
+  migrate:
+    name: Run migration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Configure kubectl
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p $HOME/.kube
+          echo "$KUBE_CONFIG" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Get short hash
+        id: hash
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Prepare migration job manifest
+        id: prepare
+        env:
+          APP: ${{ inputs.service-name }}
+          MIGRATION_ACTION: ${{ inputs.migration-action }}
+          MIGRATION_COMMAND: ${{ inputs.migration-command }}
+          SHORT_SHA: ${{ steps.hash.outputs.short }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          IMAGE_TAG: latest
+          NAMESPACE: ${{ inputs.namespace }}
+          DB_HOST: ${{ inputs.db-host }}
+          DB_PORT: ${{ inputs.db-port }}
+          DB_NAME: ${{ inputs.db-name }}
+          DB_SECRET_NAME: ${{ inputs.db-secret-name }}
+        run: |
+          export APP MIGRATION_ACTION MIGRATION_COMMAND SHORT_SHA GITHUB_RUN_NUMBER IMAGE_TAG NAMESPACE DB_HOST DB_PORT DB_NAME DB_SECRET_NAME
+          envsubst < "${{ inputs.job-template-path }}" > /tmp/migration-job.yaml
+          cat /tmp/migration-job.yaml
+          echo "job-name=${APP}-migrate-${MIGRATION_ACTION}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}" >> $GITHUB_OUTPUT
+
+      - name: Apply migration job
+        if: inputs.dry-run == 'false'
+        run: kubectl apply -f /tmp/migration-job.yaml
+
+      - name: Dry-run migration job
+        if: inputs.dry-run == 'true'
+        run: |
+          echo "### Migration job (dry run)" >> $GITHUB_STEP_SUMMARY
+          echo '```yaml' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/migration-job.yaml >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Wait for migration job completion
+        if: inputs.dry-run == 'false'
+        run: |
+          JOB_NAME="${{ steps.prepare.outputs.job-name }}"
+          NAMESPACE="${{ inputs.namespace }}"
+          echo "Waiting for job $JOB_NAME..."
+          for i in $(seq 1 120); do
+            COMPLETE=$(kubectl get job/$JOB_NAME -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/$JOB_NAME -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$COMPLETE" = "True" ]; then
+              echo "Migration succeeded"; kubectl logs -n $NAMESPACE job/$JOB_NAME --tail=100; exit 0
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "Migration failed"; kubectl logs -n $NAMESPACE job/$JOB_NAME --tail=100; exit 1
+            fi
+            sleep 5
+          done
+          echo "Migration timed out"; kubectl logs -n $NAMESPACE job/$JOB_NAME --tail=100; exit 1

@@ -26,4 +26,4 @@ are produced in CI and deployed as the Pages artifact.
 ## Enable GitHub Pages
 
 In the repository settings, set Pages source to "GitHub Actions". The `docs`
-workflow then publishes to `https://computeflux-org.github.io/shared-infrastructure/`.
+workflow then publishes to `https://computeflux-xyz.github.io/shared-infrastructure/`.

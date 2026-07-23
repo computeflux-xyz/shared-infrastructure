@@ -1,0 +1,59 @@
+name: Go CI
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to test/lint (module subtree)"
+        type: string
+        required: true
+      go-version:
+        type: string
+        required: false
+        default: "1.26"
+      system-deps:
+        description: "Extra apt packages to install (space-separated), e.g. libvips-dev"
+        type: string
+        required: false
+        default: ""
+      run-integration-tests:
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  go-test:
+    name: Go Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Install system dependencies
+        if: inputs.system-deps != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ inputs.system-deps }}
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: Unit tests
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          LOG_LEVEL: FATAL
+        run: go test -race -v ./...
+
+      - name: Integration tests
+        if: inputs.run-integration-tests
+        working-directory: ${{ inputs.working-directory }}
+        run: go test -tags=integrationtest ./...

@@ -34,7 +34,7 @@ deploy --> dev : deployment summary
 
 note over flags, deploy
   Reusable workflows live in
-  computeflux-org/shared-infrastructure/.github/workflows/
+  computeflux-xyz/shared-infrastructure/.github/workflows/
   and are called with `uses: ...@main`.
 end note
 @enduml

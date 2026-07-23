@@ -1,0 +1,268 @@
+name: Check pipeline flags
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Name of the service"
+        type: string
+        required: true
+      service-path:
+        description: "Path to service directory (e.g., services/bijougabriel-api)"
+        type: string
+        required: true
+    outputs:
+      should-push-app-image:
+        description: "Whether to push application Docker image to registry"
+        value: ${{ jobs.check.outputs.should-push-app-image }}
+      should-push-migration-image:
+        description: "Whether to push migration Docker image to registry"
+        value: ${{ jobs.check.outputs.should-push-migration-image }}
+      should-test-migrations:
+        description: "Whether to run migration tests"
+        value: ${{ jobs.check.outputs.should-test-migrations }}
+      should-run-migrations:
+        description: "Whether to run migrations on Kubernetes"
+        value: ${{ jobs.check.outputs.should-run-migrations }}
+      should-deploy:
+        description: "Whether to deploy to Kubernetes"
+        value: ${{ jobs.check.outputs.should-deploy }}
+      migration-action:
+        description: "Migration action (up, down_to_XXX, or empty)"
+        value: ${{ jobs.check.outputs.migration-action }}
+      migration-command:
+        description: "Migration command for migrate CLI"
+        value: ${{ jobs.check.outputs.migration-command }}
+      migration-files-changed:
+        description: "Whether migration files have changed"
+        value: ${{ jobs.check.outputs.migration-files-changed }}
+      is-main-push:
+        description: "Whether this is a push to main branch"
+        value: ${{ jobs.check.outputs.is-main-push }}
+      dry-run:
+        description: "Whether to run in dry-run mode (no changes applied)"
+        value: ${{ jobs.check.outputs.dry-run }}
+      image-tag:
+        description: "Docker image tag to use for deployment"
+        value: ${{ jobs.check.outputs.image-tag }}
+
+jobs:
+  check:
+    name: Analyze flags
+    runs-on: ubuntu-latest
+    outputs:
+      should-push-app-image: ${{ steps.flags.outputs.should-push-app-image }}
+      should-push-migration-image: ${{ steps.flags.outputs.should-push-migration-image }}
+      should-test-migrations: ${{ steps.flags.outputs.should-test-migrations }}
+      should-run-migrations: ${{ steps.flags.outputs.should-run-migrations }}
+      should-deploy: ${{ steps.flags.outputs.should-deploy }}
+      migration-action: ${{ steps.flags.outputs.migration-action }}
+      migration-command: ${{ steps.flags.outputs.migration-command }}
+      migration-files-changed: ${{ steps.flags.outputs.migration-files-changed }}
+      is-main-push: ${{ steps.flags.outputs.is-main-push }}
+      dry-run: ${{ steps.flags.outputs.dry-run }}
+      image-tag: ${{ steps.flags.outputs.image-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Analyze flags and conditions
+        id: flags
+        # NOTE: commit messages and PR titles are passed through env vars rather
+        # than `${{ ... }}` interpolation. Inlining those expressions into the
+        # shell script would break (and is a script-injection vector) whenever
+        # the message contains quotes, backticks, $(...), etc.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PUSH_HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          SHOULD_PUSH_APP_IMAGE="false"
+          SHOULD_PUSH_MIGRATION_IMAGE="false"
+          SHOULD_TEST_MIGRATIONS="false"
+          SHOULD_RUN_MIGRATIONS="false"
+          SHOULD_DEPLOY="false"
+          MIGRATION_ACTION=""
+          MIGRATION_COMMAND=""
+          MIGRATION_FILES_CHANGED="false"
+          IS_MAIN_PUSH="false"
+          DRY_RUN="true"
+          IMAGE_TAG="pr-${{ github.event.pull_request.number || github.run_number }}"
+
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            COMMIT_MSG="$PR_TITLE"
+            HEAD_COMMIT_MSG=$(git log -1 --pretty=%B)
+          else
+            COMMIT_MSG="$PUSH_HEAD_COMMIT_MSG"
+            HEAD_COMMIT_MSG="$COMMIT_MSG"
+          fi
+
+          echo "Commit message: $COMMIT_MSG"
+          echo "HEAD commit message: $HEAD_COMMIT_MSG"
+
+          if [ "$EVENT_NAME" == "push" ] && [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            IS_MAIN_PUSH="true"
+            IMAGE_TAG="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+            echo "Main branch push detected"
+          fi
+
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            MIGRATION_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- "${{ inputs.service-path }}/db-migration/**" | wc -l)
+          else
+            MIGRATION_CHANGES=$(git diff --name-only HEAD^ HEAD -- "${{ inputs.service-path }}/db-migration/**" 2>/dev/null | wc -l || echo "0")
+          fi
+
+          if [ "$MIGRATION_CHANGES" -gt "0" ]; then
+            MIGRATION_FILES_CHANGED="true"
+            echo "Migration files changed"
+          fi
+
+          HAS_IMAGE_PUSH="false"
+          HAS_DEPLOY="false"
+          HAS_MIGRATE_DOWN="false"
+          MIGRATE_DOWN_VERSION=""
+
+          if [[ "$HEAD_COMMIT_MSG" == *"--image-push"* ]]; then
+            HAS_IMAGE_PUSH="true"
+            echo "--image-push flag detected"
+          fi
+
+          if [[ "$HEAD_COMMIT_MSG" == *"--deploy"* ]]; then
+            HAS_DEPLOY="true"
+            echo "--deploy flag detected"
+          fi
+
+          if [[ "$HEAD_COMMIT_MSG" =~ --force-migrate-down-([0-9]+) ]]; then
+            HAS_MIGRATE_DOWN="true"
+            MIGRATE_DOWN_VERSION="${BASH_REMATCH[1]}"
+            echo "--force-migrate-down-$MIGRATE_DOWN_VERSION flag detected"
+
+            if [ "$IS_MAIN_PUSH" == "true" ]; then
+              echo "Force flag present for main branch"
+            fi
+          elif [[ "$HEAD_COMMIT_MSG" =~ --migrate-down-([0-9]+) ]]; then
+            MIGRATE_DOWN_VERSION="${BASH_REMATCH[1]}"
+
+            if [ "$IS_MAIN_PUSH" == "true" ]; then
+              echo "ERROR: Down migrations on main branch require --force-migrate-down-VERSION flag"
+              echo "::error::Down migrations on main require --force-migrate-down-$MIGRATE_DOWN_VERSION (not --migrate-down-$MIGRATE_DOWN_VERSION)"
+              exit 1
+            fi
+
+            HAS_MIGRATE_DOWN="true"
+            echo "--migrate-down-$MIGRATE_DOWN_VERSION flag detected"
+          fi
+
+          if [ "$HAS_MIGRATE_DOWN" == "true" ]; then
+            MIGRATION_ACTION="down-to-${MIGRATE_DOWN_VERSION}"
+            MIGRATION_COMMAND="down ${MIGRATE_DOWN_VERSION}"
+            echo "Migration action: down to version $MIGRATE_DOWN_VERSION"
+          elif [ "$MIGRATION_FILES_CHANGED" == "true" ] || [ "$HAS_DEPLOY" == "true" ] || [ "$IS_MAIN_PUSH" == "true" ]; then
+            MIGRATION_ACTION="up"
+            MIGRATION_COMMAND="up"
+            echo "Migration action: up"
+          fi
+
+          if [ "$IS_MAIN_PUSH" == "true" ]; then
+            SHOULD_PUSH_APP_IMAGE="true"
+            SHOULD_PUSH_MIGRATION_IMAGE="true"
+            SHOULD_TEST_MIGRATIONS="true"
+            SHOULD_RUN_MIGRATIONS="true"
+            DRY_RUN="false"
+            IMAGE_TAG="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+
+            if [ "$HAS_MIGRATE_DOWN" == "false" ]; then
+              SHOULD_DEPLOY="true"
+            else
+              echo "Skipping deployment because this is a down migration"
+            fi
+
+          elif [ "$EVENT_NAME" == "pull_request" ]; then
+            DRY_RUN="true"
+            IMAGE_TAG="pr-${{ github.event.pull_request.number }}"
+
+            if [ "$MIGRATION_FILES_CHANGED" == "true" ]; then
+              SHOULD_TEST_MIGRATIONS="true"
+            fi
+
+            if [ "$HAS_IMAGE_PUSH" == "true" ]; then
+              SHOULD_PUSH_APP_IMAGE="true"
+              echo "Will push app image (--image-push)"
+            fi
+
+            if [ "$HAS_DEPLOY" == "true" ]; then
+              SHOULD_PUSH_APP_IMAGE="true"
+              SHOULD_PUSH_MIGRATION_IMAGE="true"
+              SHOULD_TEST_MIGRATIONS="true"
+              SHOULD_RUN_MIGRATIONS="true"
+              SHOULD_DEPLOY="true"
+              echo "Full deployment pipeline (--deploy)"
+            fi
+
+            if [ "$HAS_MIGRATE_DOWN" == "true" ]; then
+              SHOULD_TEST_MIGRATIONS="true"
+              SHOULD_RUN_MIGRATIONS="true"
+              SHOULD_PUSH_MIGRATION_IMAGE="true"
+              echo "Will run down migration (no deploy)"
+            fi
+
+          elif [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.force-deploy }}" == "true" ]; then
+              SHOULD_PUSH_APP_IMAGE="true"
+              SHOULD_PUSH_MIGRATION_IMAGE="true"
+              SHOULD_TEST_MIGRATIONS="true"
+              SHOULD_RUN_MIGRATIONS="true"
+              SHOULD_DEPLOY="true"
+              DRY_RUN="false"
+              IMAGE_TAG="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+              echo "Manual deployment triggered"
+            fi
+          fi
+
+          if [ "$SHOULD_RUN_MIGRATIONS" == "true" ] && [ -z "$MIGRATION_ACTION" ]; then
+            MIGRATION_ACTION="up"
+            MIGRATION_COMMAND="up"
+            echo "Defaulting migration action to 'up'"
+          fi
+
+          echo "should-push-app-image=${SHOULD_PUSH_APP_IMAGE}" >> $GITHUB_OUTPUT
+          echo "should-push-migration-image=${SHOULD_PUSH_MIGRATION_IMAGE}" >> $GITHUB_OUTPUT
+          echo "should-test-migrations=${SHOULD_TEST_MIGRATIONS}" >> $GITHUB_OUTPUT
+          echo "should-run-migrations=${SHOULD_RUN_MIGRATIONS}" >> $GITHUB_OUTPUT
+          echo "should-deploy=${SHOULD_DEPLOY}" >> $GITHUB_OUTPUT
+          echo "migration-action=${MIGRATION_ACTION}" >> $GITHUB_OUTPUT
+          echo "migration-command=${MIGRATION_COMMAND}" >> $GITHUB_OUTPUT
+          echo "migration-files-changed=${MIGRATION_FILES_CHANGED}" >> $GITHUB_OUTPUT
+          echo "is-main-push=${IS_MAIN_PUSH}" >> $GITHUB_OUTPUT
+          echo "dry-run=${DRY_RUN}" >> $GITHUB_OUTPUT
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create summary
+        run: |
+          echo "## Pipeline Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** ${{ inputs.service-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Event | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Is Main Push | ${{ steps.flags.outputs.is-main-push }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dry Run | ${{ steps.flags.outputs.dry-run }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | ${{ steps.flags.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Migration Files Changed | ${{ steps.flags.outputs.migration-files-changed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Actions to Perform" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | Will Run |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Push App Image | ${{ steps.flags.outputs.should-push-app-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Push Migration Image | ${{ steps.flags.outputs.should-push-migration-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Migrations | ${{ steps.flags.outputs.should-test-migrations }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Migrations | ${{ steps.flags.outputs.should-run-migrations }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy to K8s | ${{ steps.flags.outputs.should-deploy }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.flags.outputs.migration-action }}" != "" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "** Migration Action:** \`${{ steps.flags.outputs.migration-action }}\`" >> $GITHUB_STEP_SUMMARY
+          fi

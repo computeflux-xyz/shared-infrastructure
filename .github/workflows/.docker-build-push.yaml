@@ -1,0 +1,146 @@
+name: Docker build and push
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to the service directory containing Dockerfile"
+        type: string
+        required: true
+      image-name:
+        description: "Docker image name (defaults to directory basename)"
+        type: string
+        required: false
+      should-push:
+        description: "Whether to push the image to registry"
+        type: boolean
+        required: true
+      image-tag:
+        description: "Image tag to use"
+        type: string
+        required: false
+        default: "latest"
+      extra-build-args:
+        description: "Additional Docker build args (one per line, KEY=VALUE format)"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      image-digest:
+        description: "Image digest"
+        value: ${{ jobs.build.outputs.digest }}
+      image-tags:
+        description: "Image tags"
+        value: ${{ jobs.build.outputs.tags }}
+
+jobs:
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract image name
+        id: image-name
+        run: |
+          if [ -n "${{ inputs.image-name }}" ]; then
+            IMAGE_NAME="${{ inputs.image-name }}"
+          else
+            IMAGE_NAME=$(basename "${{ inputs.working-directory }}")
+          fi
+          echo "name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "Image name: ${IMAGE_NAME}"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Configure kubectl
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p $HOME/.kube
+          echo "$KUBE_CONFIG" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Get registry credentials
+        id: registry-creds
+        run: |
+          REGISTRY_URL="registry.computeflux.xyz"
+          REGISTRY_USER=$(kubectl get secret -n platform zot-registry-auth -o jsonpath='{.data.username}' | base64 -d)
+          REGISTRY_PASS=$(kubectl get secret -n platform zot-registry-auth -o jsonpath='{.data.password}' | base64 -d)
+
+          if [ -z "$REGISTRY_PASS" ]; then
+            echo "ERROR: Failed to fetch registry password"
+            exit 1
+          fi
+
+          echo "registry-url=${REGISTRY_URL}" >> $GITHUB_OUTPUT
+          echo "registry-user=${REGISTRY_USER}" >> $GITHUB_OUTPUT
+          echo "::add-mask::${REGISTRY_PASS}"
+          echo "registry-password=${REGISTRY_PASS}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Registry
+        if: inputs.should-push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.registry-creds.outputs.registry-url }}
+          username: ${{ steps.registry-creds.outputs.registry-user }}
+          password: ${{ steps.registry-creds.outputs.registry-password }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.registry-creds.outputs.registry-url }}/${{ steps.image-name.outputs.name }}
+          tags: |
+            type=raw,value=${{ inputs.image-tag }}
+            type=sha,prefix={{branch}}-
+          flavor: |
+            latest=false
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          file: ${{ inputs.working-directory }}/Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.should-push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.revision'] }}
+            VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] }}
+            ${{ inputs.extra-build-args }}
+          cache-from: type=gha,scope=${{ steps.image-name.outputs.name }}
+          cache-to: type=gha,mode=max,scope=${{ steps.image-name.outputs.name }}
+
+      - name: Create build summary
+        run: |
+          echo "## Docker build complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.image-name.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ steps.registry-creds.outputs.registry-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Pushed:** ${{ inputs.should-push }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.should-push }}" == "true" ]; then
+            echo "<details>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>Image tags</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_Build only, no push_" >> $GITHUB_STEP_SUMMARY
+          fi

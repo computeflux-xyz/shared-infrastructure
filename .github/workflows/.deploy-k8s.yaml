@@ -1,0 +1,143 @@
+name: Deploy to Kubernetes
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to helmfile directory"
+        type: string
+        required: true
+      dry-run:
+        description: "Run helm diff only (no apply)"
+        type: string
+        required: false
+        default: "true"
+      image-tag:
+        description: "Docker image tag to deploy"
+        type: string
+        required: false
+        default: "latest"
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract release info from path
+        id: release-info
+        run: |
+          RELEASE_NAME=$(echo "${{ inputs.working-directory }}" | cut -d'/' -f2)
+          echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "namespace=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "Release: ${RELEASE_NAME}, Namespace: ${RELEASE_NAME}"
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28.0"
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Configure kubectl
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p $HOME/.kube
+          echo "$KUBE_CONFIG" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Verify cluster access
+        run: |
+          echo "### Cluster info" >> $GITHUB_STEP_SUMMARY
+          kubectl cluster-info >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Failed to get cluster info" >> $GITHUB_STEP_SUMMARY
+
+      - name: Setup namespace and secrets
+        if: inputs.dry-run == 'false'
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          NAMESPACE="${{ steps.release-info.outputs.namespace }}"
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+          for secret in *.sealed.yaml; do
+            if [ -f "$secret" ]; then
+              echo "Applying $secret..."
+              kubectl apply -f "$secret"
+            fi
+          done
+
+          echo "Waiting for secrets to be ready..."
+          sleep 5
+
+      - name: Helm diff
+        if: inputs.dry-run == 'true'
+        uses: helmfile/helmfile-action@v2.0.4
+        with:
+          helm-version: "v3.19.2"
+          helmfile-version: "v1.1.0"
+          helmfile-args: diff -f ${{ inputs.working-directory }}/helmfile.gotmpl
+        env:
+            IMAGE_TAG: ${{ inputs.image-tag }}
+
+      - name: Helm apply
+        if: inputs.dry-run == 'false'
+        uses: helmfile/helmfile-action@v2.0.4
+        with:
+          helm-version: "v3.19.2"
+          helmfile-version: "v1.1.0"
+          helmfile-args: apply -f ${{ inputs.working-directory }}/helmfile.gotmpl
+        env:
+          IMAGE_TAG: ${{ inputs.image-tag }}
+
+      - name: Ensure rollout is not stuck
+        if: inputs.dry-run == 'false'
+        run: |
+          # Check if rollout is degraded and abort if needed
+          STATUS=$(kubectl-argo-rollouts status ${{ steps.release-info.outputs.release-name }} \
+            -n ${{ steps.release-info.outputs.namespace }} \
+            --timeout 5s 2>&1 || true)
+
+          if echo "$STATUS" | grep -q "Degraded"; then
+            echo "Rollout is degraded, aborting and retrying..."
+            kubectl-argo-rollouts abort ${{ steps.release-info.outputs.release-name }} \
+              -n ${{ steps.release-info.outputs.namespace }} || true
+            sleep 2
+            kubectl-argo-rollouts retry rollout ${{ steps.release-info.outputs.release-name }} \
+              -n ${{ steps.release-info.outputs.namespace }}
+          fi
+
+      - name: Wait for rollout
+        if: inputs.dry-run == 'false'
+        run: |
+          echo "Waiting for rollout to complete..."
+          kubectl-argo-rollouts status ${{ steps.release-info.outputs.release-name }} \
+            -n ${{ steps.release-info.outputs.namespace }} \
+            --timeout 300s
+          echo "Rollout complete"
+
+      - name: Create deployment summary
+        run: |
+          echo "## Deployment summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release:** ${{ steps.release-info.outputs.release-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** ${{ steps.release-info.outputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image tag:** ${{ inputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry run:** ${{ inputs.dry-run }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry-run }}" == "false" ]; then
+            echo "### Rollout status" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl-argo-rollouts get rollout ${{ steps.release-info.outputs.release-name }} -n ${{ steps.release-info.outputs.namespace }} >> $GITHUB_STEP_SUMMARY 2>&1 || echo "Could not get rollout status" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Pods" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            kubectl get pods -n ${{ steps.release-info.outputs.namespace }} -l app=${{ steps.release-info.outputs.release-name }} >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No pods found" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
