@@ -35,7 +35,11 @@ jobs:
           exit $fail
 
       - name: Init (no backend)
-        run: terraform init -backend=false
+        run: |
+          # terraform.tfstate is git-crypt-encrypted in CI (binary, not JSON); hide
+          # it so init/validate, which only type-check config here, don't parse it.
+          [ -f terraform.tfstate ] && mv terraform.tfstate /tmp/tfstate.enc || true
+          terraform init -backend=false
 
       - name: Validate
         run: terraform validate
