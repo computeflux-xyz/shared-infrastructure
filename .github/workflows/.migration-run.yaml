@@ -84,7 +84,15 @@ jobs:
 
       - name: Apply migration job
         if: inputs.dry-run == 'false'
-        run: kubectl apply -f /tmp/migration-job.yaml
+        run: |
+          # A Job's spec.template is immutable, so `kubectl apply` fails with
+          # "field is immutable" if a Job of this name already exists. That happens
+          # on a workflow re-run: github.run_number is unchanged across re-runs and
+          # the previous Job lingers (ttlSecondsAfterFinished: 24h). Delete any
+          # pre-existing Job first so this step is idempotent.
+          kubectl delete job "${{ steps.prepare.outputs.job-name }}" \
+            -n "${{ inputs.namespace }}" --ignore-not-found=true --wait=true --timeout=120s
+          kubectl apply -f /tmp/migration-job.yaml
 
       - name: Dry-run migration job
         if: inputs.dry-run == 'true'

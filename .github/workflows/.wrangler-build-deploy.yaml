@@ -1,0 +1,135 @@
+name: Wrangler Build & Deploy
+
+# Reusable: build a standalone Cloudflare Workers app (Astro/etc.) and deploy it
+# with wrangler. Assumes the app is self-contained in working-directory (its own
+# lockfile); no monorepo workspace build.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "App directory (contains package.json + lockfile + wrangler.toml)"
+        required: true
+        type: string
+      worker-name:
+        description: "Cloudflare Worker name (for logs/summary)"
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      package-manager:
+        description: "pnpm or npm"
+        required: false
+        type: string
+        default: "pnpm"
+      build-command:
+        description: "Package script to build the worker bundle"
+        required: false
+        type: string
+        default: "build"
+      deployment-url:
+        description: "Public URL (for the summary + smoke test); skip smoke test if empty"
+        required: false
+        type: string
+        default: ""
+      environment:
+        required: false
+        type: string
+        default: "production"
+      dry-run:
+        required: false
+        type: boolean
+        default: false
+      should-deploy:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy Worker
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.deployment-url }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup pnpm
+        if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Build worker
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run ${{ inputs.build-command }}
+          else
+            npm run ${{ inputs.build-command }}
+          fi
+        env:
+          NODE_ENV: production
+
+      - name: Verify build output
+        run: |
+          test -f dist/_worker.js/index.js && echo "worker entry found" || { echo "missing dist/_worker.js/index.js"; exit 1; }
+
+      - name: Deploy to Cloudflare Workers
+        if: inputs.should-deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          RUN="pnpm wrangler"; [ "${{ inputs.package-manager }}" = "npm" ] && RUN="npx wrangler"
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            echo "Dry-run: validating deploy"; $RUN deploy --dry-run
+          else
+            $RUN deploy
+          fi
+
+      - name: Summary
+        if: ${{ inputs.should-deploy && !inputs.dry-run }}
+        run: |
+          {
+            echo "## Deployed ${{ inputs.worker-name }}"
+            echo "- Environment: ${{ inputs.environment }}"
+            [ -n "${{ inputs.deployment-url }}" ] && echo "- URL: ${{ inputs.deployment-url }}"
+            echo "- Commit: ${{ github.sha }}"
+          } >> $GITHUB_STEP_SUMMARY
+
+  smoke-test:
+    name: Smoke Test
+    needs: build-and-deploy
+    if: ${{ inputs.should-deploy && !inputs.dry-run && inputs.deployment-url != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe deployment URL
+        run: |
+          sleep 5
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ inputs.deployment-url }}")
+          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+            echo "OK (HTTP $CODE)"
+          else
+            echo "HTTP $CODE (may still be propagating)"
+          fi
