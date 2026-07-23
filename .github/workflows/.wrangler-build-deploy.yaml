@@ -24,6 +24,11 @@ on:
         required: false
         type: string
         default: "pnpm"
+      pnpm-version:
+        description: "pnpm version (pnpm/action-setup needs it when package.json has no packageManager field)"
+        required: false
+        type: string
+        default: "10"
       build-command:
         description: "Package script to build the worker bundle"
         required: false
@@ -72,6 +77,8 @@ jobs:
       - name: Setup pnpm
         if: inputs.package-manager == 'pnpm'
         uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
 
       - name: Install dependencies
         run: |
